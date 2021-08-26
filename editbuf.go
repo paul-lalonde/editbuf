@@ -1,10 +1,21 @@
 package editbuf
 
+import (
+	"fmt"
+	"strings"
+)
+
+const (
+	BLOCKLEN = 512
+)
+
+var blockLen = BLOCKLEN // Exposed so tests can change this.
+
 // left, buf, right
-type node struct {
+type node struct { // Should I store q0 at each span? lets me hold a cache of current page.
 	left, right *node
-	leftlength, fulllength int
-	buf []rune
+	leftlength int
+	buf []rune // If I have children I have no content.
 	style Style
 }
 
@@ -14,12 +25,15 @@ type Style interface {
 type Editbuf struct {
 	root *node
 	len int
+	blocklen int
 }
 
 func New() *Editbuf {
 	return &Editbuf{
-		&node{nil, nil, 0, 0, make([]rune, 0, 128), nil}, 0,
-	}
+			root: newNode(nil,nil),
+			len: 0,
+			blocklen: blockLen,
+		}
 }
 
 func (eb *Editbuf)Insert(q0 int, s []rune) {
@@ -27,9 +41,37 @@ func (eb *Editbuf)Insert(q0 int, s []rune) {
 }
 
 func (eb *Editbuf)String() string {
-	acc := make([]rune, 0, eb.root.fulllength)
-	eb.root.string(0, eb.root.fulllength, &acc)
+	treelen := eb.root.len()
+	acc := make([]rune, 0, treelen)
+	eb.root.string(0, treelen, &acc)
 	return string(acc)
+}
+
+
+func (n *node)String() string {
+	if n.buf != nil {
+		return fmt.Sprintf("('%v'[%d])", string(n.buf), cap(n.buf))
+	}
+	b := strings.Builder{}
+	b.WriteString("(")
+	if n.left != nil {
+		fmt.Fprintf(&b, "%v", n.left)
+	}
+	if n.right != nil {
+		fmt.Fprintf(&b, "%v", n.right)
+	}
+	b.WriteString(")")
+	return b.String()
+}
+
+func (n *node)len() (l int) {
+	if n.buf != nil {
+		return len(n.buf)
+	}
+	if n.right != nil {
+		l = n.right.len()
+	}
+	return n.leftlength + l
 }
 
 // Insert allocates at most one buffer and two nodes to do the insertion.
@@ -39,41 +81,56 @@ func (eb *Editbuf)String() string {
 // Returns the new root (in case of rebalancing)
 
 func (n *node)insert(q0 int, s []rune) *node {
-	// If I'm visiting this node, it and/or its children will get longer
-	n.fulllength += len(s)
-	if q0 < n.leftlength {
-		n.left.insert(q0,s) // Always fully insert.
+	// Do I belong left or right?
+	if n.left != nil && q0 <= n.leftlength {
+		n.leftlength += len(s)
+		n.left = n.left.insert(q0, s)
 		return n
-	} else if q0 < len(n.buf) {
-		// insertion point is in my buffer
-		n.buf = append(n.buf[0:q0 - n.leftlength], append(s, n.buf[q0:]...)...)
-		// Missing logic - if I grow longer than my buffer I need to 
-		// split at the insertion point, pushing part left, part right,
-		// and leaving buf == s
+	}
+	if n.right != nil && q0 > n.leftlength {
+		n.right = n.right.insert(q0 - n.leftlength, s)
+		return n
+	}
+	// Do I fit in this node?
+	if len(s) < cap(n.buf) - len(n.buf) {
+		olen := len(n.buf)
+		n.buf = n.buf[0:olen+len(s)]
+		copy(n.buf[q0 + len(s):], n.buf[q0:olen]) // shift elements up
+		copy(n.buf[q0:], s)	// Copy in s
+		return n
+	} 
+	// Didn't fit.  Split and recurse.
+	n.left = &node{nil, nil, 0, n.buf, nil}
+	n.right = newNode(nil, nil) // &node{nil, nil, 0, nil, nil}
+	if len(n.buf) > 0 {
+		n.left.buf = n.buf[0:q0] // Re-use the buffer
+		n.leftlength = q0
+		n.right = n.right.insert(0, n.buf[q0:])
+	}
+	n.buf = nil
+	if q0 < cap(n.left.buf)/2 { // fill the emptier side
+		ilen := cap(n.left.buf) - len(n.left.buf)
+		if ilen > len(s) {
+			ilen = len(s)
+		}
+		n.left.buf = append(n.left.buf, s[0:ilen]...)
+		n.left = n.left.insert(q0+ilen, s[ilen:]) // Or should I restart from the root to balance?
+		n.leftlength += ilen
 		return n
 	} else {
-		// Insertion point is to my right
-		if n.right == nil {
-			n.right = newNode(nil, nil, s)
-		} else {
-			n.right.insert(q0 - n.leftlength - len(n.buf), s)
-		}
+		n.right = n.right.insert(0, s) 
 		return n
 	}
 }
 
-// Expensive, traverses the whole tree.
-func (n *node) length() int {
-	return n.fulllength
-}
-
-func newNode(left, right *node, s []rune) *node{
-	n := &node{left, right, 0, len(s), s, nil}
+func newNode(left, right *node) *node{
+	n := &node{
+		left: left,
+		right: right,
+		buf: make([]rune, 0, blockLen),
+		}
 	if left != nil {
-		n.leftlength = left.length()
-	}
-	if right != nil {
-		n.fulllength += right.fulllength
+		n.leftlength = left.len()
 	}
 	return n
 }
@@ -92,27 +149,22 @@ func (n *node)find(offset int) (*node, int) {
 
 // To avoid allocations pass acc at least q1-q0 capacity
 func (n *node)string(q0, q1 int, acc *[]rune) (used int) {
-	checklen := q1 - q0
+	if n.buf != nil {
+		if q1 > len(n.buf) {
+			q1 = len(n.buf)
+		}
+		*acc = append(*acc, n.buf[q0:q1]...)
+		return q1-q0
+	}
 	if q0 < n.leftlength {
-		used = n.left.string(q0, q1, acc)
+		used += n.left.string(q0, q1, acc)
 		if used == q1 - q0 {
 			return used
 		}
 		q0 = 0 // Make q0 & q1 relative to n.buf
 		q1 -= used
 	}
-	if q1 <= len(n.buf) {
-		*acc = append(*acc, n.buf[q0:q1]...)
-		used += q1 - q0
-		return used
-	} 
 	// And down the right 
-	*acc = append(*acc, n.buf[q0:]...)
-	used += len(n.buf)
-	q1 -= len(n.buf)
-	used += n.right.string(0, q1, acc)
-	if used != checklen {
-		panic("Failed to find all my segments")
-	}
+	used += n.right.string(0, q1 - q0, acc)
 	return used
 }
